@@ -1,9 +1,11 @@
-use crate::util::{read_i16, read_magic, read_u8, read_u16, read_u24, read_u32};
-use std::{fs::File, io::Read};
+use crate::util::{read_bytes, read_i16, read_magic, read_u8, read_u16, read_u24, read_u32};
+use std::{fs::File, io::Read, path::Path};
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, ensure};
 
+// -- structs mirror the file format; some fields are only read by the debug dumps
 #[derive(Debug)]
+#[allow(dead_code)]
 struct DataRef {
     ref_type: u8,
     data_type: u8,
@@ -12,6 +14,7 @@ struct DataRef {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct BrstmHeader {
     magic_string: [u8; 4], // -- always "RSTM"
     byte_order_mark: u16,  // -- always "0xFEFF", for mkwii this is big-endian
@@ -28,6 +31,7 @@ struct BrstmHeader {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct HeadSection {
     magic_string: [u8; 4], // -- "HEAD"
     size: u32,
@@ -37,26 +41,28 @@ struct HeadSection {
 }
 
 #[derive(Debug)]
-struct StreamInfo {
-    format: u8, // -- 0 = PCM8, 1 = PCM16, 2 = ADPCM (only ADPCM is supported)
-    loop_flag: u8,
-    channel_count: u8,
-    sample_rate: u32,  // -- stored as a 24-bit int in the file
-    unknown_0x06: u16, // -- "offset to block header?" per the wiki, always 0
-    loop_start_sample: u32,
-    loop_end_sample: u32,
-    actual_data_offset: u32, // -- absolute file offset of the first audio byte (not relative to DATA)
-    block_count: u32,
-    block_size: u32,
-    block_samples: u32,
-    final_block_size: u32,
-    final_block_samples: u32,
-    final_block_size_padded: u32,
-    adpc_interval: u32, // -- sample-count interval between ADPC history entries
-    adpc_bytes_per_interval: u32, // -- bytes per channel per ADPC entry (2 hist samples = 4 bytes)
+#[allow(dead_code)]
+pub struct StreamInfo {
+    pub format: u8, // -- 0 = PCM8, 1 = PCM16, 2 = ADPCM (only ADPCM is supported)
+    pub loop_flag: u8,
+    pub channel_count: u8,
+    pub sample_rate: u32,  // -- stored as a 24-bit int in the file
+    pub unknown_0x06: u16, // -- "offset to block header?" per the wiki, always 0
+    pub loop_start_sample: u32,
+    pub sample_count: u32, // -- wiki calls this loop_end_sample, but it's always the total sample count
+    pub actual_data_offset: u32, // -- absolute file offset of the first audio byte (not relative to DATA)
+    pub block_count: u32,
+    pub block_size: u32,
+    pub block_samples: u32,
+    pub final_block_size: u32,
+    pub final_block_samples: u32,
+    pub final_block_size_padded: u32,
+    pub adpc_interval: u32, // -- sample-count interval between ADPC history entries
+    pub adpc_bytes_per_interval: u32, // -- bytes per channel per ADPC entry (2 hist samples = 4 bytes)
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct ChannelTable {
     channel_count: u8,
     padding: [u8; 3],
@@ -64,6 +70,7 @@ struct ChannelTable {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct AdpcmParameters {
     coefficients: [[i16; 2]; 8],
     gain: u16,
@@ -76,6 +83,7 @@ struct AdpcmParameters {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct DataSection {
     magic_string: [u8; 4], // -- "DATA"
     size: u32,
@@ -83,8 +91,21 @@ struct DataSection {
 }
 
 #[derive(Debug)]
-struct DecodedSampleData {
-    samples: Vec<Vec<i16>>,
+pub struct Track {
+    pub volume: u8, // -- 127 unless track info is extended
+    pub pan: u8,    // -- 64 unless track info is extended
+    pub channels: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct DecodedSampleData {
+    pub samples: Vec<Vec<i16>>,
+    pub channel_count: u16,
+    pub sample_rate: u32,
+    pub loop_start: Option<u32>, // -- loops always run to the end of the stream
+    pub tracks: Vec<Track>,
+    pub extended_tracks: bool,
+    pub stream_info: StreamInfo,
 }
 
 struct AdpcmState {
@@ -92,30 +113,30 @@ struct AdpcmState {
     hist2: i16,
 }
 
-fn parse_data_ref(buf: &[u8], offset: &mut usize) -> DataRef {
-    DataRef {
-        ref_type: read_u8(buf, offset),
-        data_type: read_u8(buf, offset),
-        reserved: read_u16(buf, offset),
-        val: read_u32(buf, offset),
-    }
+fn parse_data_ref(buf: &[u8], offset: &mut usize) -> Result<DataRef> {
+    Ok(DataRef {
+        ref_type: read_u8(buf, offset)?,
+        data_type: read_u8(buf, offset)?,
+        reserved: read_u16(buf, offset)?,
+        val: read_u32(buf, offset)?,
+    })
 }
 
-pub fn parse_file_header(buf: &[u8]) -> Result<BrstmHeader> {
+fn parse_file_header(buf: &[u8]) -> Result<BrstmHeader> {
     let mut offset: usize = 0;
     let header = BrstmHeader {
-        magic_string: read_magic(buf, &mut offset),
-        byte_order_mark: read_u16(buf, &mut offset),
-        version: read_u16(buf, &mut offset),
-        file_size: read_u32(buf, &mut offset),
-        header_size: read_u16(buf, &mut offset),
-        section_count: read_u16(buf, &mut offset),
-        head_offset: read_u32(buf, &mut offset),
-        head_size: read_u32(buf, &mut offset),
-        adpc_offset: read_u32(buf, &mut offset),
-        adpc_size: read_u32(buf, &mut offset),
-        data_offset: read_u32(buf, &mut offset),
-        data_size: read_u32(buf, &mut offset),
+        magic_string: read_magic(buf, &mut offset)?,
+        byte_order_mark: read_u16(buf, &mut offset)?,
+        version: read_u16(buf, &mut offset)?,
+        file_size: read_u32(buf, &mut offset)?,
+        header_size: read_u16(buf, &mut offset)?,
+        section_count: read_u16(buf, &mut offset)?,
+        head_offset: read_u32(buf, &mut offset)?,
+        head_size: read_u32(buf, &mut offset)?,
+        adpc_offset: read_u32(buf, &mut offset)?,
+        adpc_size: read_u32(buf, &mut offset)?,
+        data_offset: read_u32(buf, &mut offset)?,
+        data_size: read_u32(buf, &mut offset)?,
     };
 
     if header.magic_string != *b"RSTM" {
@@ -124,10 +145,26 @@ pub fn parse_file_header(buf: &[u8]) -> Result<BrstmHeader> {
             header.magic_string
         );
     }
+    if header.byte_order_mark != 0xFEFF {
+        bail!(
+            "unsupported byte order mark 0x{:04x} (expected 0xFEFF)",
+            header.byte_order_mark
+        );
+    }
+    if header.version != 0x0100 {
+        log::warn!("unexpected BRSTM version 0x{:04x}", header.version);
+    }
     if header.header_size != 0x40 {
         bail!(
             "unexpected file header size: 0x{:x} (expected 0x40)",
             header.header_size
+        );
+    }
+    if header.file_size as usize != buf.len() {
+        log::warn!(
+            "header says file is {} bytes, but it is {}",
+            header.file_size,
+            buf.len()
         );
     }
 
@@ -137,11 +174,11 @@ pub fn parse_file_header(buf: &[u8]) -> Result<BrstmHeader> {
 fn parse_head_section(buf: &[u8], head_offset: usize) -> Result<HeadSection> {
     let mut offset = head_offset;
     let section = HeadSection {
-        magic_string: read_magic(buf, &mut offset),
-        size: read_u32(buf, &mut offset),
-        stream_data: parse_data_ref(buf, &mut offset),
-        track_table: parse_data_ref(buf, &mut offset),
-        channel_data: parse_data_ref(buf, &mut offset),
+        magic_string: read_magic(buf, &mut offset)?,
+        size: read_u32(buf, &mut offset)?,
+        stream_data: parse_data_ref(buf, &mut offset)?,
+        track_table: parse_data_ref(buf, &mut offset)?,
+        channel_data: parse_data_ref(buf, &mut offset)?,
     };
 
     if section.magic_string != *b"HEAD" {
@@ -153,22 +190,22 @@ fn parse_head_section(buf: &[u8], head_offset: usize) -> Result<HeadSection> {
 
 fn parse_stream_info(buf: &[u8], mut offset: usize) -> Result<StreamInfo> {
     let info = StreamInfo {
-        format: read_u8(buf, &mut offset),
-        loop_flag: read_u8(buf, &mut offset),
-        channel_count: read_u8(buf, &mut offset),
-        sample_rate: read_u24(buf, &mut offset),
-        unknown_0x06: read_u16(buf, &mut offset),
-        loop_start_sample: read_u32(buf, &mut offset),
-        loop_end_sample: read_u32(buf, &mut offset),
-        actual_data_offset: read_u32(buf, &mut offset),
-        block_count: read_u32(buf, &mut offset),
-        block_size: read_u32(buf, &mut offset),
-        block_samples: read_u32(buf, &mut offset),
-        final_block_size: read_u32(buf, &mut offset),
-        final_block_samples: read_u32(buf, &mut offset),
-        final_block_size_padded: read_u32(buf, &mut offset),
-        adpc_interval: read_u32(buf, &mut offset),
-        adpc_bytes_per_interval: read_u32(buf, &mut offset),
+        format: read_u8(buf, &mut offset)?,
+        loop_flag: read_u8(buf, &mut offset)?,
+        channel_count: read_u8(buf, &mut offset)?,
+        sample_rate: read_u24(buf, &mut offset)?,
+        unknown_0x06: read_u16(buf, &mut offset)?,
+        loop_start_sample: read_u32(buf, &mut offset)?,
+        sample_count: read_u32(buf, &mut offset)?,
+        actual_data_offset: read_u32(buf, &mut offset)?,
+        block_count: read_u32(buf, &mut offset)?,
+        block_size: read_u32(buf, &mut offset)?,
+        block_samples: read_u32(buf, &mut offset)?,
+        final_block_size: read_u32(buf, &mut offset)?,
+        final_block_samples: read_u32(buf, &mut offset)?,
+        final_block_size_padded: read_u32(buf, &mut offset)?,
+        adpc_interval: read_u32(buf, &mut offset)?,
+        adpc_bytes_per_interval: read_u32(buf, &mut offset)?,
     };
 
     if info.format != 2 {
@@ -177,52 +214,91 @@ fn parse_stream_info(buf: &[u8], mut offset: usize) -> Result<StreamInfo> {
             info.format
         );
     }
+    ensure!(info.channel_count > 0, "stream has zero channels");
+    ensure!(info.sample_rate > 0, "stream has a sample rate of 0");
 
     Ok(info)
 }
 
-fn parse_channel_table(buf: &[u8], mut offset: usize) -> ChannelTable {
-    let channel_count = read_u8(buf, &mut offset);
+fn parse_track_table(
+    buf: &[u8],
+    head_base: usize,
+    mut offset: usize,
+) -> Result<(bool, Vec<Track>)> {
+    let track_count = read_u8(buf, &mut offset)?;
+    let extended = match read_u8(buf, &mut offset)? {
+        0 => false,
+        1 => true,
+        other => bail!("unknown track info type {}", other),
+    };
+    offset += 2; // -- padding
+
+    let mut tracks = Vec::with_capacity(track_count as usize);
+    for _ in 0..track_count {
+        let track_ref = parse_data_ref(buf, &mut offset)?;
+        let mut track_offset = head_base + track_ref.val as usize;
+        let (volume, pan) = if extended {
+            let volume = read_u8(buf, &mut track_offset)?;
+            let pan = read_u8(buf, &mut track_offset)?;
+            track_offset += 6; // -- padding + reserved
+            (volume, pan)
+        } else {
+            (127, 64)
+        };
+        let channel_count = read_u8(buf, &mut track_offset)?;
+        let channels = read_bytes(buf, &mut track_offset, channel_count as usize)?.to_vec();
+        tracks.push(Track {
+            volume,
+            pan,
+            channels,
+        });
+    }
+
+    Ok((extended, tracks))
+}
+
+fn parse_channel_table(buf: &[u8], mut offset: usize) -> Result<ChannelTable> {
+    let channel_count = read_u8(buf, &mut offset)?;
     let padding = [
-        read_u8(buf, &mut offset),
-        read_u8(buf, &mut offset),
-        read_u8(buf, &mut offset),
+        read_u8(buf, &mut offset)?,
+        read_u8(buf, &mut offset)?,
+        read_u8(buf, &mut offset)?,
     ];
     let channel_refs = (0..channel_count)
         .map(|_| parse_data_ref(buf, &mut offset))
-        .collect();
+        .collect::<Result<_>>()?;
 
-    ChannelTable {
+    Ok(ChannelTable {
         channel_count,
         padding,
         channel_refs,
-    }
+    })
 }
 
-fn parse_adpcm_parameters(buf: &[u8], mut offset: usize) -> AdpcmParameters {
+fn parse_adpcm_parameters(buf: &[u8], mut offset: usize) -> Result<AdpcmParameters> {
     let mut coefficients = [[0i16; 2]; 8];
     for pair in coefficients.iter_mut() {
-        pair[0] = read_i16(buf, &mut offset);
-        pair[1] = read_i16(buf, &mut offset);
+        pair[0] = read_i16(buf, &mut offset)?;
+        pair[1] = read_i16(buf, &mut offset)?;
     }
 
-    AdpcmParameters {
+    Ok(AdpcmParameters {
         coefficients,
-        gain: read_u16(buf, &mut offset),
-        predictor_scale: read_u16(buf, &mut offset),
-        yn1: read_i16(buf, &mut offset),
-        yn2: read_i16(buf, &mut offset),
-        loop_predictor_scale: read_u16(buf, &mut offset),
-        loop_yn1: read_i16(buf, &mut offset),
-        loop_yn2: read_i16(buf, &mut offset),
-    }
+        gain: read_u16(buf, &mut offset)?,
+        predictor_scale: read_u16(buf, &mut offset)?,
+        yn1: read_i16(buf, &mut offset)?,
+        yn2: read_i16(buf, &mut offset)?,
+        loop_predictor_scale: read_u16(buf, &mut offset)?,
+        loop_yn1: read_i16(buf, &mut offset)?,
+        loop_yn2: read_i16(buf, &mut offset)?,
+    })
 }
 
 fn parse_data_section(buf: &[u8], mut offset: usize) -> Result<DataSection> {
     let section = DataSection {
-        magic_string: read_magic(buf, &mut offset),
-        size: read_u32(buf, &mut offset),
-        offset_to_data: read_u32(buf, &mut offset),
+        magic_string: read_magic(buf, &mut offset)?,
+        size: read_u32(buf, &mut offset)?,
+        offset_to_data: read_u32(buf, &mut offset)?,
     };
 
     if section.magic_string != *b"DATA" {
@@ -237,7 +313,7 @@ fn decode_data_section(
     data_start: usize,
     stream_info: &StreamInfo,
     channel_params: &[AdpcmParameters],
-) -> Result<DecodedSampleData> {
+) -> Result<Vec<Vec<i16>>> {
     let total_samples = if stream_info.block_count == 0 {
         0
     } else {
@@ -271,20 +347,19 @@ fn decode_data_section(
         };
 
         for ch in 0..stream_info.channel_count {
-            let chunk = &buf[offset..offset + block_size as usize];
+            let mut chunk_offset = offset;
+            let chunk = read_bytes(buf, &mut chunk_offset, block_size as usize)?;
             decode_adpcm_block(
                 chunk,
                 &channel_params[ch as usize].coefficients,
                 &mut states[ch as usize],
                 block_samples as usize,
                 &mut decoded_samples[ch as usize],
-            );
+            )?;
             offset += stride as usize;
         }
     }
-    Ok(DecodedSampleData {
-        samples: decoded_samples,
-    })
+    Ok(decoded_samples)
 }
 
 fn decode_adpcm_block(
@@ -293,13 +368,14 @@ fn decode_adpcm_block(
     state: &mut AdpcmState,
     sample_count: usize,
     out: &mut Vec<i16>,
-) {
+) -> Result<()> {
     let target_len = out.len() + sample_count;
     let mut i = 0;
     while i < chunk.len() && out.len() < target_len {
         // first parse the first byte of a frame
         let scale = 1i32 << (chunk[i] & 0xf);
         let coef_idx = ((chunk[i] >> 4) & 0xf) as usize;
+        ensure!(coef_idx < 8, "invalid predictor index {} in frame header", coef_idx);
         let [coef1, coef2] = coefficients[coef_idx];
         i += 1;
 
@@ -333,14 +409,15 @@ fn decode_adpcm_block(
             }
         }
     }
+    Ok(())
 }
 
-pub fn decode_brstm(file_path: &str) -> Result<()> {
+pub fn decode_brstm(file_path: &Path) -> Result<DecodedSampleData> {
     let mut file = File::open(file_path)?;
     let file_size = file.metadata()?.len();
     let mut buffer = Vec::with_capacity(usize::try_from(file_size)?);
     let bytes_read = file.read_to_end(&mut buffer)?;
-    log::info!("read {} bytes", bytes_read);
+    log::debug!("read {} bytes", bytes_read);
 
     let header = parse_file_header(&buffer)?;
     log::debug!("{:#x?}", header);
@@ -348,15 +425,29 @@ pub fn decode_brstm(file_path: &str) -> Result<()> {
     let head_section = parse_head_section(&buffer, header.head_offset as usize)?;
     log::debug!("{:#x?}", head_section);
 
-    // Every DataRef `val` inside HEAD is relative to this base
+    // Every DataRef val inside HEAD is relative to this base
     let head_base = header.head_offset as usize + 0x08;
 
     let stream_info_offset = head_base + head_section.stream_data.val as usize;
     let stream_info = parse_stream_info(&buffer, stream_info_offset)?;
     log::debug!("{:#x?}", stream_info);
 
+    let track_table_offset = head_base + head_section.track_table.val as usize;
+    let (extended_tracks, tracks) = parse_track_table(&buffer, head_base, track_table_offset)?;
+    log::debug!("{:#x?}", tracks);
+    for track in &tracks {
+        for &c in &track.channels {
+            ensure!(
+                c < stream_info.channel_count,
+                "track references channel {}, but the stream only has {}",
+                c,
+                stream_info.channel_count
+            );
+        }
+    }
+
     let channel_table_offset = head_base + head_section.channel_data.val as usize;
-    let channel_table = parse_channel_table(&buffer, channel_table_offset);
+    let channel_table = parse_channel_table(&buffer, channel_table_offset)?;
     log::debug!("{:#x?}", channel_table);
 
     if channel_table.channel_count != stream_info.channel_count {
@@ -370,12 +461,12 @@ pub fn decode_brstm(file_path: &str) -> Result<()> {
     let mut channels = Vec::with_capacity(channel_table.channel_count as usize);
     for outer_ref in &channel_table.channel_refs {
         let mut inner_offset = head_base + outer_ref.val as usize;
-        let inner_ref = parse_data_ref(&buffer, &mut inner_offset);
+        let inner_ref = parse_data_ref(&buffer, &mut inner_offset)?;
         if inner_ref.val == 0 {
             bail!("channel has no ADPCM parameter data");
         }
         let adpcm_offset = head_base + inner_ref.val as usize;
-        channels.push(parse_adpcm_parameters(&buffer, adpcm_offset));
+        channels.push(parse_adpcm_parameters(&buffer, adpcm_offset)?);
     }
     log::debug!("{:#x?}", channels);
 
@@ -385,7 +476,7 @@ pub fn decode_brstm(file_path: &str) -> Result<()> {
     // `actual_data_offset` is already an absolute file offset
     let data_start = stream_info.actual_data_offset as usize;
 
-    log::info!(
+    log::debug!(
         "sample_rate={} channels={} block_count={} block_size={} block_samples={} data_start=0x{:x}",
         stream_info.sample_rate,
         stream_info.channel_count,
@@ -402,19 +493,23 @@ pub fn decode_brstm(file_path: &str) -> Result<()> {
         &channels,
     )?;
 
-    let spec = hound::WavSpec {
-        channels: stream_info.channel_count as u16,
-        sample_rate: stream_info.sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let mut writer = hound::WavWriter::create("test.wav", spec)?;
-    let num_samples = decoded_samples.samples[0].len();
-    for i in 0..num_samples {
-        for channel in &decoded_samples.samples {
-            writer.write_sample(channel[i])?;
-        }
+    if decoded_samples[0].len() != stream_info.sample_count as usize {
+        log::warn!(
+            "decoded {} samples, but header says {}",
+            decoded_samples[0].len(),
+            stream_info.sample_count
+        );
     }
-    Ok(())
+
+    let loop_start = (stream_info.loop_flag != 0).then_some(stream_info.loop_start_sample);
+
+    Ok(DecodedSampleData {
+        samples: decoded_samples,
+        sample_rate: stream_info.sample_rate,
+        channel_count: stream_info.channel_count as u16,
+        loop_start,
+        tracks,
+        extended_tracks,
+        stream_info,
+    })
 }
